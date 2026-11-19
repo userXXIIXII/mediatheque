@@ -1,6 +1,7 @@
 from django.db import models
 from django.utils import timezone
 from datetime import timedelta
+from django.core.exceptions import ValidationError
 
 # 1. Modèles de médias (POO)
 
@@ -68,10 +69,50 @@ class Emprunt(models.Model):
     date_emprunt = models.DateField(default=timezone.now, verbose_name="Date d'emprunt")
 
     #Stocke la date limite de restitution du média
-    date_retour_prevue = models.DateField(verbose_name="Date de retour prévue")
+    date_retour_prevue = models.DateField(blank=True, verbose_name="Date de retour prévue")
 
     # Date réelle à laquelle l'adhérent a ramené le média (reste vide / NULL tant qu'il ne l'a pas rendu)
     date_retour_effective = models.DateField(null=True, blank=True, verbose_name="Date de retour effective")
+
+    #méthode clean() pour vérifier les règles métier (membre pénalisé, unicité et disponibilité du média)
+    def clean(self):
+        super().clean()
+        errors = {}
+
+        #bloque l'emprunt si le membre est pénalisé
+        if self.membre_id and self.membre.est_penalise:
+            errors["membre"] = "Ce membre est pénalisé et ne peut pas effectuer d'emprunt."
+
+        #vérifie qu'un seul média est choisi (ni 0 ni plus d'1)
+        medias = [m for m in (self.livre, self.cd, self.dvd) if m is not None]
+        if len(medias) == 0:
+            errors["__all__"] = "Vous devez sélectionner un média (Livre, CD ou DVD)."
+        elif len(medias) > 1:
+            errors["__all__"] = "Un emprunt ne peut concerner qu'un seul média à la fois."
+        else:
+            #vérifie que le média n'a pas déjà un emprunt en cours (date_retour_effective vide)
+            media = medias[0]
+            if isinstance(media, Livre):
+                filtre = {"livre": media}
+            elif isinstance(media, Cd):
+                filtre = {"cd": media}
+            else:
+                filtre = {"dvd": media}
+
+            emprunts_actifs = Emprunt.objects.filter(
+                date_retour_effective__isnull=True,
+                **filtre,
+            )
+            #exclut l'emprunt courant lors d'une modification (ex. saisie de date_retour_effective)
+            if self.pk:
+                emprunts_actifs = emprunts_actifs.exclude(pk=self.pk)
+
+            if emprunts_actifs.exists():
+                errors["__all__"] = f"Le média « {media} » est déjà en cours d'emprunt."
+
+        #lève ValidationError si au moins une règle n'est pas respectée
+        if errors:
+            raise ValidationError(errors)
 
     def save(self, *args, **kwargs):
         #Surcharge de la méthode save() : On intercepte l'enregistrement pour appliquer une logique métier automatique
@@ -79,6 +120,9 @@ class Emprunt(models.Model):
         if not self.date_retour_prevue:
             # timedelta(days=7) : Permet d'ajouter exactement 7 jours (1 semaine) à la date actuelle du jour.
             self.date_retour_prevue = timezone.now().date() + timedelta(days=7)
+
+        #déclenche les validations (dont clean(()) avant l'écriture en base
+        self.full_clean()
 
         # Appel de la méthode save() d'origine de Django pour finaliser l'écriture effective dans la base MySQL
         super().save(*args, **kwargs)
